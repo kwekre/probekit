@@ -21,10 +21,18 @@ class Detector(ABC):
 
     # ---- 工具方法 ----
     async def _get(self, target: "Target", value: str) -> "object":
-        # 用原始查询字典 + 被测参数覆盖，避免 URL 自带 query 与 params 合并冲突
+        """按参数所在位置(query/body)构造请求并发送。"""
+        if target.location == "body":
+            data = dict(target.body_params)
+            data[target.param] = value
+            return await self.req.request(target.method, target.url, data=data)
         p = dict(target.params)
         p[target.param] = value
-        return await self.req.request("GET", target.url, params=p)
+        return await self.req.request(target.method, target.url, params=p)
+
+    async def _raw(self, url: str, headers: dict = None) -> "object":
+        """直接发一个请求（站点级检测用，如 JWT 取基线）。"""
+        return await self.req.request("GET", url, headers=headers or {})
 
     @staticmethod
     def _similar(a: str, b: str) -> float:
