@@ -5,6 +5,7 @@ from typing import List
 from ..http import Requester
 from ..config import Config
 from ..models import Target, Finding
+from ..denoise import normalized_similar
 
 
 class Detector(ABC):
@@ -36,7 +37,9 @@ class Detector(ABC):
 
     @staticmethod
     def _similar(a: str, b: str) -> float:
-        """基于长度比的相似度，0(完全不同)~1(等长)。"""
-        if not a and not b:
-            return 1.0
-        return min(len(a), len(b)) / max(len(a), len(b))
+        """去噪后的响应相似度（0~1）。
+
+        先剥离 CSRF/会话/时间戳/哈希/JWT 等高熵随机变量再比长度，
+        避免页面每次响应都带的 token 抖动造成布尔盲注误判或 SSRF 基线失效。
+        """
+        return normalized_similar(a, b)
