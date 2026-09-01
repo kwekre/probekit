@@ -5,11 +5,13 @@ import asyncio
 import json
 import hmac
 import hashlib
+import uuid
 import urllib.parse as up
 
 from aiohttp import web
 
 from probekit.config import Config
+from probekit.denoise import normalize_body, normalize_headers, normalized_similar
 from probekit.engine import Scanner
 from probekit.crawler import targets_from_html
 from probekit.models import Target
@@ -27,6 +29,20 @@ async def h_sqli(request):
     if "'" in v:
         return web.Response(status=500, text="You have an error in your SQL syntax")
     return web.Response(text="ok")
+
+
+async def h_sqli_bool(request):
+    # 布尔盲注模拟：每次响应都带不同的 CSRF token（旋转）。
+    # true 条件(无 1=2)返回“有数据”的长页面；false 条件(1=2)返回短页面。
+    # 未做去噪时，旋转 token 会让 baseline 与 true 相似度 < 0.9 -> 漏报；
+    # 去噪后 token 被掩掉，baseline≈true（长页），false（短页）明显不同 -> 命中。
+    v = request.query.get("id", "")
+    token = uuid.uuid4().hex
+    if "1=2" in v:
+        return web.Response(
+            text=f"<html>no results <input name=csrf value={token}></html>")
+    return web.Response(
+        text=f"<html>user list: alice,bob,carol,dave <input name=csrf value={token}></html>")
 
 
 async def h_xss(request):
@@ -116,6 +132,7 @@ def h_jwt(request):
 def build_app():
     app = web.Application()
     app.router.add_get("/sqli", h_sqli)
+    app.router.add_get("/sqli_bool", h_sqli_bool)
     app.router.add_get("/xss", h_xss)
     app.router.add_get("/ssrf", h_ssrf)
     app.router.add_get("/redir", h_redir)
@@ -166,6 +183,10 @@ async def run_all(base):
     cfg.headers = {"Authorization": "Bearer " + valid}
     site_t = Target(url=base + "/jwt", param="", is_site=True)
     results["jwt"] = await JwtDetector(req, cfg).scan(site_t)
+
+    # 布尔盲注：去噪后应稳定命中（旋转 CSRF token 不再干扰 baseline 比对）
+    b = Scanner.extract_targets(base + "/sqli_bool?id=1")[0]
+    results["bool_sqli"] = await SQLiDetector(req, cfg).scan(b)
 
     # 站点级：敏感信息泄露
     info_t = Target(url=base + "/info", param="", is_site=True)
@@ -225,6 +246,7 @@ def main():
         "jwt": len(res["jwt"]) >= 2,   # alg=none + 弱密钥 secret
         "info_leak": len(res["info_leak"]) >= 3,  # 私钥+内网IP+栈跟踪
         "cors": len(res["cors"]) >= 1,                # 反射Origin+凭据
+        "bool_sqli": len(res["bool_sqli"]) >= 1,      # 布尔盲注(去噪后命中)
         "crawler_has_id": "id" in res["crawler_params"],
         "crawler_has_post": res["crawler_post"],
         "crawler_has_q": "q" in res["crawler_params"],
@@ -238,8 +260,37 @@ def main():
     print("[PASS] 全部检测通过:", ", ".join(checks))
     print("[PASS] 检测器数量:", sum(len(res[k]) for k in
           ["sqli", "xss", "ssrf", "openredirect", "command_injection",
-           "path_traversal", "jwt", "xss_post", "info_leak", "cors"]))
+           "path_traversal", "jwt", "xss_post", "info_leak", "cors",
+           "bool_sqli"]))
+
+
+def test_denoise():
+    """去噪模块单测：证明随机变量被剥离、真实差异保留。"""
+    # 1) 仅差一个旋转 CSRF token -> 去噪后应完全相同
+    a = "<html>welcome guest <input name=csrf value=abc123def456></html>"
+    b = "<html>welcome guest <input name=csrf value=zzz999yyy888></html>"
+    assert normalized_similar(a, b) == 1.0, "CSRF token 抖动应被去噪消除"
+
+    # 2) 真实 DB 报错文本应保留（不被误当成噪声），故两响应不相似
+    normal = "<html>welcome guest <input name=csrf value=abc></html>"
+    errored = normal + " You have an error in your SQL syntax near '1'"
+    assert normalized_similar(normal, errored) < 0.9, "报错文本不应被去噪抹掉"
+
+    # 3) JWT / UUID / 时间戳 / 哈希 等被替换为占位符
+    raw = ('auth: eyJhbGc.eyJ1c2.S.x; '
+           'sid=3f2a11b9-4c5d-4e6f-8a9b-0c1d2e3f4a5b; '
+           'at=2026-09-01T10:00:00; '
+           'h=9f86d081884c7d659a2feaa0c55ad015')
+    n = normalize_body(raw)
+    assert "<JWT>" in n and "<UUID>" in n and "<TS>" in n and "<H32>" in n, n
+
+    # 4) 易变响应头被丢弃
+    hdrs = {"Content-Type": "text/html", "Set-Cookie": "sid=1", "Date": "now"}
+    nh = normalize_headers(hdrs)
+    assert "Set-Cookie" not in nh and "Date" not in nh and "Content-Type" in nh
+    print("[PASS] test_denoise: 去噪模块单测通过")
 
 
 if __name__ == "__main__":
+    test_denoise()
     main()
