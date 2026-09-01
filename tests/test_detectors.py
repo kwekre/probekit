@@ -1,90 +1,213 @@
-"""
-真实可运行测试：起一个本地漏洞模拟服务，跑 probekit 全部检测器并断言命中。
-
-运行：  python tests/test_detectors.py
-（需 aiohttp：pip install -r requirements.txt）
+"""端到端检测验证：起本地漏洞模拟服务，逐一断言检测器能命中。
+运行：在仓库根目录执行  $env:PYTHONPATH="." ; python -m pytest tests  (或 python tests/test_detectors.py)
 """
 import asyncio
-import sys
+import json
+import hmac
+import hashlib
+import urllib.parse as up
 
 from aiohttp import web
 
 from probekit.config import Config
 from probekit.engine import Scanner
-from probekit.models import Finding
+from probekit.crawler import targets_from_html
+from probekit.models import Target
+from probekit.detectors import (
+    SQLiDetector, XSSDetector, SSRFDetector, OpenRedirectDetector,
+    CommandInjectionDetector, PathTraversalDetector, JwtDetector,
+)
+from probekit.detectors.jwt import _b64url_encode, _b64url_decode
 
-# ---------- 漏洞模拟服务 ----------
+
+# ---------- 模拟漏洞服务端 ----------
 async def h_sqli(request):
-    qid = request.query.get("id", "1")
-    if "'" in qid:
-        return web.Response(text="You have an error in your SQL syntax near ''",
-                            status=500)
-    if "1=2" in qid:
-        return web.Response(text="<html>no rows</html>")
-    return web.Response(text="<html>user: alice</html>")
+    v = request.query.get("id", "")
+    if "'" in v:
+        return web.Response(status=500, text="You have an error in your SQL syntax")
+    return web.Response(text="ok")
+
 
 async def h_xss(request):
-    q = request.query.get("q", "")
-    return web.Response(text=f"<html>search: {q}</html>")
+    v = request.query.get("q", "")
+    return web.Response(text=f"<p>q={v}</p>")
+
 
 async def h_ssrf(request):
-    url = request.query.get("url", "")
-    if "169.254.169.254" in url:
-        return web.Response(text="MOCK_METADATA:ami-id i-0123")
-    return web.Response(text="fetched external ok")
+    u = request.query.get("url", "")
+    host = up.urlparse(u).hostname or ""
+    if host in ("169.254.169.254", "127.0.0.1", "localhost"):
+        return web.Response(text="ami-id: mock-instance")
+    return web.Response(text="external")
+
 
 async def h_redir(request):
     nxt = request.query.get("next", "")
-    if nxt.startswith("//") or nxt.startswith("http"):
+    if nxt.startswith("http"):
         raise web.HTTPFound(nxt)
-    return web.Response(text="<html>home</html>")
+    return web.Response(text="ok")
 
-def make_app():
+
+async def h_cmd(request):
+    v = request.query.get("cmd", "")
+    if "PRBCMD7Z9" in v:
+        return web.Response(text="result=PRBCMD7Z9")
+    return web.Response(text="ok")
+
+
+async def h_traversal(request):
+    v = request.query.get("file", "")
+    if ".." in v or "%2e%2e" in v or "%252e" in v or "..%2f" in v:
+        return web.Response(text="root:x:0:0:root:/root:/bin/bash")
+    return web.Response(text="ok")
+
+
+async def h_xsspost(request):
+    data = await request.post()
+    v = data.get("q", "")
+    return web.Response(text=f"<p>q={v}</p>")
+
+
+SECRET = b"secret"
+
+
+def h_jwt(request):
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        return web.Response(status=401, text="no auth")
+    tok = auth[7:]
+    try:
+        hseg, pseg, sig = tok.split(".")
+        hh = json.loads(_b64url_decode(hseg))
+    except Exception:
+        return web.Response(status=401, text="bad")
+    alg = hh.get("alg")
+    if alg == "none":                      # 故意 Vulnerable：接受 alg=none
+        return web.Response(text="authed")
+    if alg == "HS256":
+        expect = _b64url_encode(hmac.new(SECRET, f"{hseg}.{pseg}".encode(),
+                                         hashlib.sha256).digest())
+        if sig == expect:
+            return web.Response(text="authed")
+        return web.Response(status=401, text="bad sig")
+    return web.Response(status=401, text="unsupported")
+
+
+def build_app():
     app = web.Application()
     app.router.add_get("/sqli", h_sqli)
     app.router.add_get("/xss", h_xss)
     app.router.add_get("/ssrf", h_ssrf)
     app.router.add_get("/redir", h_redir)
+    app.router.add_get("/cmd", h_cmd)
+    app.router.add_get("/traversal", h_traversal)
+    app.router.add_post("/xsspost", h_xsspost)
+    app.router.add_get("/jwt", h_jwt)
     return app
 
-# ---------- 断言 ----------
-def assert_find(findings, detector):
-    names = {f.detector for f in findings}
-    assert detector in names, f"未检测到 {detector}，实际: {names}"
 
-async def main():
-    app = make_app()
+# ---------- 测试体 ----------
+async def run_all(base):
+    cfg = Config()
+    s = Scanner(cfg)
+    req = s.req
+    results = {}
+
+    t = Scanner.extract_targets(base + "/sqli?id=1")[0]
+    results["sqli"] = await SQLiDetector(req, cfg).scan(t)
+
+    t = Scanner.extract_targets(base + "/xss?q=x")[0]
+    results["xss"] = await XSSDetector(req, cfg).scan(t)
+
+    t = Scanner.extract_targets(base + "/ssrf?url=http://example.com/")[0]
+    results["ssrf"] = await SSRFDetector(req, cfg).scan(t)
+
+    t = Scanner.extract_targets(base + "/redir?next=/dashboard")[0]
+    results["openredirect"] = await OpenRedirectDetector(req, cfg).scan(t)
+
+    t = Scanner.extract_targets(base + "/cmd?cmd=")[0]
+    results["command_injection"] = await CommandInjectionDetector(req, cfg).scan(t)
+
+    t = Scanner.extract_targets(base + "/traversal?file=")[0]
+    results["path_traversal"] = await PathTraversalDetector(req, cfg).scan(t)
+
+    # POST 表单 XSS：手工构造 location=body 的 Target
+    post_t = Target(url=base + "/xsspost", param="q", method="POST",
+                    original="", body_params={"q": ""}, location="body")
+    results["xss_post"] = await XSSDetector(req, cfg).scan(post_t)
+
+    # JWT：提供合法 token（secret=secret），端点对 alg=none 与弱密钥均脆弱
+    hseg = _b64url_encode(json.dumps({"alg": "HS256", "typ": "JWT"}).encode())
+    pseg = _b64url_encode(json.dumps({"user": "admin"}).encode())
+    valid = hseg + "." + pseg + "." + _b64url_encode(
+        hmac.new(SECRET, f"{hseg}.{pseg}".encode(), hashlib.sha256).digest())
+    cfg.headers = {"Authorization": "Bearer " + valid}
+    site_t = Target(url=base + "/jwt", param="", is_site=True)
+    results["jwt"] = await JwtDetector(req, cfg).scan(site_t)
+
+    # 爬虫：同源链接 + 表单
+    html = (
+        '<html><body>'
+        '<a href="/page?id=5">x</a>'
+        '<a href="https://evil.com/out">y</a>'
+        '<form action="/login" method="POST">'
+        '<input name="user" value=""><input name="pass" value=""></form>'
+        '<form action="/search" method="GET">'
+        '<input name="q" value=""></form>'
+        '</body></html>'
+    )
+    ctargets = targets_from_html(html, base + "/")
+    results["crawler_params"] = sorted({t.param for t in ctargets})
+    results["crawler_post"] = any(t.location == "body" for t in ctargets)
+
+    await s.close()
+    return results
+
+
+def main():
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    app = build_app()
     runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "127.0.0.1", 0)
-    await site.start()
-    port = runner.addresses[0][1]
-    base = f"http://127.0.0.1:{port}"
 
-    cfg = Config(follow_redirects=False, timeout=5, concurrency=5)
-    scanner = Scanner(cfg)
+    async def boot():
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        host, port = runner.addresses[0]
+        return f"http://{host}:{port}"
 
-    cases = {
-        "sqli":  f"{base}/sqli?id=1",
-        "xss":   f"{base}/xss?q=hi",
-        "ssrf":  f"{base}/ssrf?url=http://example.com/",
-        "openredirect": f"{base}/redir?next=home",
+    base = loop.run_until_complete(boot())
+    try:
+        res = loop.run_until_complete(run_all(base))
+    finally:
+        loop.run_until_complete(runner.cleanup())
+
+    # 断言
+    checks = {
+        "sqli": len(res["sqli"]) >= 1,
+        "xss": len(res["xss"]) >= 1,
+        "ssrf": len(res["ssrf"]) >= 1,
+        "openredirect": len(res["openredirect"]) >= 1,
+        "command_injection": len(res["command_injection"]) >= 1,
+        "path_traversal": len(res["path_traversal"]) >= 1,
+        "xss_post": len(res["xss_post"]) >= 1,
+        "jwt": len(res["jwt"]) >= 2,   # alg=none + 弱密钥 secret
+        "crawler_has_id": "id" in res["crawler_params"],
+        "crawler_has_post": res["crawler_post"],
+        "crawler_has_q": "q" in res["crawler_params"],
     }
+    print("RESULTS:", {k: (len(v) if isinstance(v, list) else v)
+                       for k, v in res.items()})
+    failed = [k for k, ok in checks.items() if not ok]
+    if failed:
+        print("[FAIL]", failed)
+        raise SystemExit(1)
+    print("[PASS] 全部检测通过:", ", ".join(checks))
+    print("[PASS] 检测器数量:", sum(len(res[k]) for k in
+          ["sqli", "xss", "ssrf", "openredirect", "command_injection",
+           "path_traversal", "jwt", "xss_post"]))
 
-    ok = True
-    for name, url in cases.items():
-        findings = await scanner.scan_url(url)
-        try:
-            assert_find(findings, name)
-            print(f"[PASS] {name}: 检测到 {[f.detector for f in findings]}")
-        except AssertionError as e:
-            ok = False
-            print(f"[FAIL] {name}: {e}")
-
-    await scanner.close()
-    await runner.cleanup()
-    print("\n结果:", "全部通过" if ok else "存在失败")
-    return 0 if ok else 1
 
 if __name__ == "__main__":
-    sys.exit(asyncio.run(main()))
+    main()
