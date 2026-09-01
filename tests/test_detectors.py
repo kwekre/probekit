@@ -16,6 +16,7 @@ from probekit.models import Target
 from probekit.detectors import (
     SQLiDetector, XSSDetector, SSRFDetector, OpenRedirectDetector,
     CommandInjectionDetector, PathTraversalDetector, JwtDetector,
+    InfoLeakDetector, CorsDetector,
 )
 from probekit.detectors.jwt import _b64url_encode, _b64url_decode
 
@@ -71,6 +72,25 @@ async def h_xsspost(request):
 SECRET = b"secret"
 
 
+async def h_info(request):
+    body = (
+        "config: db_host=10.0.0.5, debug=true\n"
+        "-----BEGIN RSA PRIVATE KEY-----\nMOCKKEY\n-----END RSA PRIVATE KEY-----\n"
+        "Traceback (most recent call last):\n  File \"app.py\", line 1\n"
+    )
+    return web.Response(text=body)
+
+
+async def h_cors(request):
+    origin = request.headers.get("Origin")
+    if origin:
+        return web.Response(text="ok", headers={
+            "Access-Control-Allow-Origin": origin,
+            "Access-Control-Allow-Credentials": "true",
+        })
+    return web.Response(text="ok")
+
+
 def h_jwt(request):
     auth = request.headers.get("Authorization", "")
     if not auth.startswith("Bearer "):
@@ -103,6 +123,8 @@ def build_app():
     app.router.add_get("/traversal", h_traversal)
     app.router.add_post("/xsspost", h_xsspost)
     app.router.add_get("/jwt", h_jwt)
+    app.router.add_get("/info", h_info)
+    app.router.add_get("/cors", h_cors)
     return app
 
 
@@ -144,6 +166,14 @@ async def run_all(base):
     cfg.headers = {"Authorization": "Bearer " + valid}
     site_t = Target(url=base + "/jwt", param="", is_site=True)
     results["jwt"] = await JwtDetector(req, cfg).scan(site_t)
+
+    # 站点级：敏感信息泄露
+    info_t = Target(url=base + "/info", param="", is_site=True)
+    results["info_leak"] = await InfoLeakDetector(req, cfg).scan(info_t)
+
+    # 站点级：CORS 错误配置
+    cors_t = Target(url=base + "/cors", param="", is_site=True)
+    results["cors"] = await CorsDetector(req, cfg).scan(cors_t)
 
     # 爬虫：同源链接 + 表单
     html = (
@@ -193,6 +223,8 @@ def main():
         "path_traversal": len(res["path_traversal"]) >= 1,
         "xss_post": len(res["xss_post"]) >= 1,
         "jwt": len(res["jwt"]) >= 2,   # alg=none + 弱密钥 secret
+        "info_leak": len(res["info_leak"]) >= 3,  # 私钥+内网IP+栈跟踪
+        "cors": len(res["cors"]) >= 1,                # 反射Origin+凭据
         "crawler_has_id": "id" in res["crawler_params"],
         "crawler_has_post": res["crawler_post"],
         "crawler_has_q": "q" in res["crawler_params"],
@@ -206,7 +238,7 @@ def main():
     print("[PASS] 全部检测通过:", ", ".join(checks))
     print("[PASS] 检测器数量:", sum(len(res[k]) for k in
           ["sqli", "xss", "ssrf", "openredirect", "command_injection",
-           "path_traversal", "jwt", "xss_post"]))
+           "path_traversal", "jwt", "xss_post", "info_leak", "cors"]))
 
 
 if __name__ == "__main__":
