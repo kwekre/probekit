@@ -48,7 +48,9 @@ class Requester:
                     elapsed = time.monotonic() - t0
                     return Response(
                         status=resp.status,
-                        headers=dict(resp.headers),
+                        # 保留 CIMultiDict：大小写不敏感，避免 "Set-Cookie"
+                        # 与 "access-control-allow-origin" 等键名大小写问题
+                        headers=resp.headers,
                         body=body,
                         url=str(resp.url),
                         elapsed=elapsed,
