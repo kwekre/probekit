@@ -26,8 +26,8 @@ class SSRFDetector(Detector):
 
     async def scan(self, target: Target) -> List[Finding]:
         findings: List[Finding] = []
-        # 基线：一个明显外网的、不应被代发的地址
-        base = await self._get(target, "http://probekit-marker.invalid/")
+        # 基线：一个明显外网的、不应被代发的地址（用 IP 字面量，避免 DNS 解析挂死）
+        base = await self._get(target, "http://127.0.0.1:1/")
         for internal in SSRF_TARGETS:
             resp = await self._get(target, internal)
             if resp.status == 0:
