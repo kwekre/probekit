@@ -28,6 +28,7 @@ class Requester:
         url: str,
         params: dict = None,
         data: dict = None,
+        headers: dict = None,
     ) -> Response:
         async with self._sem:
             sess = await self._session_get()
@@ -38,6 +39,7 @@ class Requester:
                     url,
                     params=params,
                     data=data,
+                    headers=headers,
                     proxy=self.config.proxy,
                     allow_redirects=self.config.follow_redirects,
                     ssl=None if self.config.verify_ssl else False,
