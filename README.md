@@ -23,8 +23,9 @@
 - **GET 与 POST 表单**参数均支持（自动按参数位置 query/body 构造请求）
 - **同源爬虫**：`--crawl` 自动发现链接与表单，扩展检测面
 - **三重输出**：人类可读文本 / 机器 JSON / **SARIF（可接入 GitHub Code Scanning 等 CI）**
+- **响应差异去噪**：比对响应前自动剥离 CSRF Token / 会话 ID / 时间戳 / 哈希 / JWT 等随机变量（`denoise.py`），只比“真实业务差异”，显著降低布尔盲注漏报与 SSRF 基线误判
 - 可扩展：新增检测器只需实现 `scan()`
-- 自带测试：本地漏洞模拟服务 + 断言，**`python tests/test_detectors.py` 全绿**
+- 自带测试：本地漏洞模拟服务 + 断言，**`python tests/test_detectors.py` 全绿**（含去噪单测）
 
 ## 架构
 
@@ -130,8 +131,8 @@ asyncio.run(run())
 
 当前为初筛级启发式，**不替代**深度人工测试。计划：
 
+- [x] 响应式差异去噪：先基准后对比，降低误报（`denoise.py` 已实现）
 - [ ] 更细的 POST/JSON/多步表单（含 CSRF Token 自动获取）
-- [ ] 响应式差异去噪：先基准后对比，降低误报
 - [ ] 被动扫描模式：读取 Burp/ZAP 流量文件
 - [ ] 接 Sigma/SOAR 输出、接资产/CMDB 系统
 
